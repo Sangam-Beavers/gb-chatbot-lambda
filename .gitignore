@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 환경설정 (AWS 키 등 비밀 포함, 절대 커밋 금지)
+.env
+.env.local
+*.env
+
+# AWS Lambda 배포 산출물
+*.zip
+deploy/
+
+# 로그
+*.log
+logs/
+
+# 기타
+*.swp
+*.swo

@@ -1,31 +1,39 @@
 """
-Chatbot core — Bedrock converse_stream call.
+Chatbot core — Bedrock converse_stream + Tool Use loop.
 
-Phase 4 Step 1 — no tool use yet. Answer based on analysis_summary alone.
-Step 2 will add tool use loop + MCP client calls.
+Phase 4 Step 2: Tool Use 루프 추가. 도구(MCP1 환율 + KB 법령) 호출 가능.
+LLM이 도구 호출 결정 → 우리 코드가 실행 → 결과 LLM에게 전달 → 최종 답변.
 
 References:
-- AWS Bedrock Converse API: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
-- Inference profile (APAC routing): apac.anthropic.claude-sonnet-4-20250514-v1:0
+- AWS Bedrock Tool Use: https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html
+- Inference profile (Sonnet 4.6): global.anthropic.claude-sonnet-4-6
 """
+import json
 import logging
 import os
+import time
 from typing import Generator, Optional
 
 import boto3
 
 from src.system_prompt import build_system_prompt
+from src.tools import TOOLS, execute_tool
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Phase 4 사전 조사(R3) 결정: APAC routing — 한국 사용자 latency 가장 낮음 + Tool Use 지원
-DEFAULT_MODEL_ID = "apac.anthropic.claude-sonnet-4-20250514-v1:0"
+# 2026-05-29: Sonnet 4 APAC이 Legacy 마킹 받아 Sonnet 4.6 (global) 으로 교체
+DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 DEFAULT_REGION = "ap-northeast-2"
+
+# Tool Use 루프 최대 반복 횟수 (도구 4번까지 + 마지막 end_turn = 5)
+MAX_TOOL_USE_ITERATIONS = 5
+
+# 시뮬레이션 스트리밍 지연 (per character, 영상에서 점진 표시 효과)
+STREAM_CHAR_DELAY = 0.005
 
 
 def _get_bedrock_client():
-    """Bedrock Runtime client. Recreated per Lambda cold start."""
     return boto3.client(
         "bedrock-runtime",
         region_name=os.environ.get("AWS_REGION", DEFAULT_REGION),
@@ -39,35 +47,33 @@ def chat_once(
     model_id: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """
-    Stream tokens for a single user message.
-
-    Phase 4 Step 1: no tool use. Answer based on analysis_summary context only.
+    Stream tokens for a single user message, with optional tool use.
 
     Args:
-        message: user question (e.g. "이 계약서 어때?")
-        analysis_summary: contract analysis summary, injected on first turn only.
-                         Format defined in result-json-schema-agreement.md §6.
-        user_lang: answer language code. Demo uses 'ko'.
-        model_id: Bedrock inference profile ID. Defaults to env BEDROCK_MODEL_ID
-                 or DEFAULT_MODEL_ID.
+        message: 사용자 질문
+        analysis_summary: 분석 요약 (첫 turn에만 주입)
+        user_lang: 답변 언어 코드 (데모는 'ko')
+        model_id: Bedrock inference profile ID (기본 Sonnet 4.6)
 
     Yields:
-        Text tokens (one character to a few characters per yield).
+        텍스트 토큰 (글자 단위, end_turn 턴의 텍스트만 흘림 - R2)
 
-    Raises:
-        botocore.exceptions.ClientError on Bedrock API errors (wrong model ID,
-        insufficient IAM permissions, throttling, etc.).
+    Flow:
+        Iteration N:
+          ① converse_stream 호출 (도구 명세 포함)
+          ② 응답 끝까지 수집 (text + toolUse 블록)
+          ③ stopReason 확인:
+             - "end_turn" → 텍스트 yield (사용자에게 흘림) → break
+             - "tool_use" → 도구 실행 → 결과 messages에 추가 → 다음 iteration
     """
     bedrock = _get_bedrock_client()
     chosen_model = (
-        model_id
-        or os.environ.get("BEDROCK_MODEL_ID")
-        or DEFAULT_MODEL_ID
+        model_id or os.environ.get("BEDROCK_MODEL_ID") or DEFAULT_MODEL_ID
     )
 
-    # Build message history
-    # On first turn, inject analysis_summary as a synthetic user+assistant pair
-    # so the model treats it as established context. (ai-chatbot-mcp.md §3-2)
+    # ──────────────────────────────────────────────────────────────────────────
+    # messages 초기 조립 (Step 1과 동일)
+    # ──────────────────────────────────────────────────────────────────────────
     messages = []
     if analysis_summary:
         messages.append({
@@ -91,39 +97,153 @@ def chat_once(
     })
 
     logger.info(
-        "Bedrock converse_stream: model=%s, has_summary=%s, message_len=%d",
+        "Chat start: model=%s, has_summary=%s, message_len=%d",
         chosen_model, analysis_summary is not None, len(message),
     )
 
-    response = bedrock.converse_stream(
-        modelId=chosen_model,
-        messages=messages,
-        system=[{"text": build_system_prompt(user_lang)}],
-        inferenceConfig={
-            "maxTokens": 2048,
-            "temperature": 0.3,  # 사실 기반 답변이라 보수적
-        },
-    )
+    # ──────────────────────────────────────────────────────────────────────────
+    # Tool Use 루프
+    # ──────────────────────────────────────────────────────────────────────────
+    for iteration in range(MAX_TOOL_USE_ITERATIONS):
+        logger.info("Tool use loop iteration %d", iteration + 1)
 
-    # Stream events:
-    #   messageStart           — generation begins
-    #   contentBlockDelta      — text token chunks (we yield these)
-    #   contentBlockStop       — end of one content block
-    #   messageStop            — stopReason: end_turn / max_tokens / stop_sequence
-    #   metadata               — usage stats
-    stop_reason = None
-    for event in response["stream"]:
-        if "contentBlockDelta" in event:
-            delta = event["contentBlockDelta"]["delta"]
-            if "text" in delta:
-                yield delta["text"]
-        elif "messageStop" in event:
-            stop_reason = event["messageStop"].get("stopReason")
-        elif "metadata" in event:
-            usage = event["metadata"].get("usage", {})
-            logger.info(
-                "Bedrock done: stopReason=%s, inputTokens=%s, outputTokens=%s",
-                stop_reason,
-                usage.get("inputTokens"),
-                usage.get("outputTokens"),
-            )
+        response = bedrock.converse_stream(
+            modelId=chosen_model,
+            messages=messages,
+            system=[{"text": build_system_prompt(user_lang)}],
+            toolConfig={"tools": TOOLS},
+            inferenceConfig={
+                "maxTokens": 2048,
+                "temperature": 0.3,  # 사실 기반 답변, 보수적
+            },
+        )
+
+        # 스트림을 끝까지 받아서 블록 단위로 재구성
+        content_blocks = []
+        current_block: Optional[dict] = None
+        stop_reason: Optional[str] = None
+
+        for event in response["stream"]:
+            if "contentBlockStart" in event:
+                start = event["contentBlockStart"]["start"]
+                if "toolUse" in start:
+                    current_block = {
+                        "type": "toolUse",
+                        "toolUseId": start["toolUse"]["toolUseId"],
+                        "name": start["toolUse"]["name"],
+                        "input_json": "",
+                    }
+                else:
+                    # 텍스트 블록 시작 (start에 type 필드 없음)
+                    current_block = {"type": "text", "text": ""}
+
+            elif "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "text" in delta:
+                    if current_block is None:
+                        # contentBlockStart 누락 케이스 — 텍스트 블록 신규 생성
+                        current_block = {"type": "text", "text": ""}
+                    if current_block.get("type") == "text":
+                        current_block["text"] += delta["text"]
+                elif "toolUse" in delta:
+                    if current_block and current_block.get("type") == "toolUse":
+                        current_block["input_json"] += delta["toolUse"].get("input", "")
+
+            elif "contentBlockStop" in event:
+                if current_block:
+                    if current_block["type"] == "toolUse":
+                        try:
+                            current_block["input"] = (
+                                json.loads(current_block["input_json"])
+                                if current_block["input_json"] else {}
+                            )
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "Failed to parse tool input JSON: %r",
+                                current_block["input_json"],
+                            )
+                            current_block["input"] = {}
+                    content_blocks.append(current_block)
+                    current_block = None
+
+            elif "messageStop" in event:
+                stop_reason = event["messageStop"].get("stopReason")
+
+            elif "metadata" in event:
+                usage = event["metadata"].get("usage", {})
+                logger.info(
+                    "Iteration %d done: stopReason=%s, in=%s, out=%s",
+                    iteration + 1, stop_reason,
+                    usage.get("inputTokens"), usage.get("outputTokens"),
+                )
+
+        # ──────────────────────────────────────────────────────────────────
+        # assistant 메시지 재구성 → messages 누적
+        # ──────────────────────────────────────────────────────────────────
+        assistant_content = []
+        for cb in content_blocks:
+            if cb["type"] == "text" and cb["text"]:
+                assistant_content.append({"text": cb["text"]})
+            elif cb["type"] == "toolUse":
+                assistant_content.append({
+                    "toolUse": {
+                        "toolUseId": cb["toolUseId"],
+                        "name": cb["name"],
+                        "input": cb["input"],
+                    }
+                })
+
+        if assistant_content:
+            messages.append({"role": "assistant", "content": assistant_content})
+
+        # ──────────────────────────────────────────────────────────────────
+        # 종료 조건 + 분기
+        # ──────────────────────────────────────────────────────────────────
+        if stop_reason == "end_turn":
+            # R2: end_turn 턴의 텍스트만 사용자에게 흘림
+            for cb in content_blocks:
+                if cb["type"] == "text":
+                    for char in cb["text"]:
+                        yield char
+                        if STREAM_CHAR_DELAY > 0:
+                            time.sleep(STREAM_CHAR_DELAY)
+            return
+
+        if stop_reason == "tool_use":
+            # 도구 실행 + 결과를 messages에 추가 → 다음 iteration
+            tool_results = []
+            for cb in content_blocks:
+                if cb["type"] == "toolUse":
+                    logger.info(
+                        "Tool call: name=%s input=%s",
+                        cb["name"], cb["input"],
+                    )
+                    result_text = execute_tool(cb["name"], cb["input"])
+                    tool_results.append({
+                        "toolResult": {
+                            "toolUseId": cb["toolUseId"],
+                            "content": [{"text": result_text}],
+                        }
+                    })
+
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+                continue
+            else:
+                # tool_use라고 했는데 toolUse 블록이 없음 — 비정상
+                logger.warning("stopReason=tool_use but no toolUse blocks found")
+                return
+
+        # 그 외 stop reason (max_tokens, stop_sequence 등) — 누적 텍스트만 yield
+        logger.warning("Unexpected stopReason: %s", stop_reason)
+        for cb in content_blocks:
+            if cb["type"] == "text":
+                for char in cb["text"]:
+                    yield char
+                    if STREAM_CHAR_DELAY > 0:
+                        time.sleep(STREAM_CHAR_DELAY)
+        return
+
+    # 루프 한도 초과 — 안전 메시지
+    logger.warning("Tool use loop exceeded max iterations (%d)", MAX_TOOL_USE_ITERATIONS)
+    yield "\n\n[죄송합니다. 답변 생성에 시간이 너무 오래 걸려 중단되었습니다.]\n"

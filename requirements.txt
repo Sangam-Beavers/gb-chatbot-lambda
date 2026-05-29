@@ -1,4 +1,7 @@
 # Chatbot Lambda dependencies
 
-# AWS SDK (Bedrock Runtime + Lambda)
+# AWS SDK (Bedrock Runtime + Bedrock Agent Runtime for KB)
 boto3>=1.34.0
+
+# Anthropic MCP Python SDK (client for MCP1 exchange server)
+mcp>=1.0.0

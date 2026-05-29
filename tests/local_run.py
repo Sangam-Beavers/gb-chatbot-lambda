@@ -1,27 +1,38 @@
 """
-Local test script — call chatbot.chat_once directly without Lambda runtime.
+Local test script — run multiple scenarios against the chatbot.
 
-Use this to verify Bedrock connection + converse_stream + token streaming
-before deploying to AWS Lambda.
+Phase 4 Step 2: 시나리오 3개 차례로 실행.
+  ① 도구 호출 없음 — "이 계약서 어때?"
+  ② MCP1 환율 도구 — "월급 베트남 돈으로 얼마야?"
+  ③ KB 법령 도구 — "외국인도 최저임금 미달이 불법이야?"
 
 Requirements:
-    - AWS credentials configured (~/.aws/credentials, env vars, or IAM role)
-    - Bedrock model access enabled on the account
-    - The inference profile apac.anthropic.claude-sonnet-4-20250514-v1:0 must be active
+    - AWS credentials configured (gb-account-b 프로필 또는 default)
+    - Bedrock model access enabled (Sonnet 4.6)
+    - KB ID KENYUCA5DE available (or set LEGAL_KB_ID env var)
+    - MCP1 환율 서버가 로컬에 떠있어야 함 (시나리오 ② 통과 위해)
+        cd ../gb-mcp-servers/mcp-exchange
+        source .venv/Scripts/activate
+        export REDIS_HOST=10.10.1.194
+        export REDIS_PORT=6379
+        export REDIS_PASSWORD=sbredis1234
+        python server.py
 
 Usage:
     cd gb-chatbot-lambda
     python -m tests.local_run
 
-If you want to test a different scenario, edit MESSAGE / ANALYSIS_SUMMARY below.
+    # 특정 시나리오만 실행:
+    python -m tests.local_run --only 2
 """
+import argparse
 import logging
 import sys
+import time
 
 from src.chatbot import chat_once
 
 
-# Set up clear logging so we can see Bedrock errors easily
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -29,10 +40,8 @@ logging.basicConfig(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scenario 1 — "Is this contract OK?"  (no tool use needed)
+# 분석 요약 — 모든 시나리오 공통 (실제로는 MySQL document_results에서 추출)
 # ──────────────────────────────────────────────────────────────────────────────
-# The analysis_summary is what would normally come from MySQL document_results
-# in production. Hardcoded here for local testing.
 ANALYSIS_SUMMARY = (
     "위험도 HIGH. "
     "최저임금 미달(시급 9,620원 기준 미충족), 주 50시간 초과근무 조항 존재. "
@@ -40,27 +49,90 @@ ANALYSIS_SUMMARY = (
     "문서유형: 근로계약서."
 )
 
-MESSAGE = "이 계약서 어때?"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 시나리오 정의
+# ──────────────────────────────────────────────────────────────────────────────
+SCENARIOS = [
+    {
+        "id": 1,
+        "name": "시나리오 ① — 분석 요약만으로 답변 (도구 호출 없음)",
+        "message": "이 계약서 어때?",
+        "expected_tools": [],
+    },
+    {
+        "id": 2,
+        "name": "시나리오 ② — MCP1 환율 도구 호출",
+        "message": "월급 200만원이 베트남 돈으로 얼마야?",
+        "expected_tools": ["get_exchange_rate"],
+    },
+    {
+        "id": 3,
+        "name": "시나리오 ③ — KB 법령 도구 호출",
+        "message": "외국인도 최저임금 미달이 법적으로 문제가 돼?",
+        "expected_tools": ["search_legal_standard"],
+    },
+]
 
 
-def main() -> int:
-    print(f"\n── 시나리오 1 — 분석 요약 보고 답변 ──\n")
+def run_scenario(scenario: dict) -> bool:
+    """Run a single scenario and stream the chatbot reply to stdout."""
+    print(f"\n{'═' * 70}")
+    print(f"  {scenario['name']}")
+    print(f"{'═' * 70}")
     print(f"분석 요약: {ANALYSIS_SUMMARY}\n")
-    print(f"사용자: {MESSAGE}\n")
+    print(f"사용자: {scenario['message']}\n")
     print(f"챗봇: ", end="", flush=True)
 
     try:
         for token in chat_once(
-            message=MESSAGE,
+            message=scenario["message"],
             analysis_summary=ANALYSIS_SUMMARY,
             user_lang="ko",
         ):
             print(token, end="", flush=True)
         print("\n")
-        return 0
+        return True
     except Exception as e:
         print(f"\n\n[에러] {type(e).__name__}: {e}\n", file=sys.stderr)
-        return 1
+        return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run chatbot scenarios locally.")
+    parser.add_argument(
+        "--only", type=int, choices=[1, 2, 3], default=None,
+        help="특정 시나리오만 실행 (1, 2, 3 중 하나). 미지정 시 전체 실행.",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=1.5,
+        help="시나리오 사이 대기 시간(초) — rate limit 회피용 (기본 1.5)",
+    )
+    args = parser.parse_args()
+
+    scenarios_to_run = (
+        [s for s in SCENARIOS if s["id"] == args.only]
+        if args.only else SCENARIOS
+    )
+
+    results = []
+    for i, scenario in enumerate(scenarios_to_run):
+        ok = run_scenario(scenario)
+        results.append((scenario["id"], ok))
+        # 다음 시나리오 전 잠깐 대기 (Bedrock rate limit 여유)
+        if i < len(scenarios_to_run) - 1 and args.delay > 0:
+            time.sleep(args.delay)
+
+    # 요약 출력
+    print(f"\n{'═' * 70}")
+    print(f"  실행 결과 요약")
+    print(f"{'═' * 70}")
+    for sid, ok in results:
+        mark = "✅" if ok else "❌"
+        print(f"  {mark} 시나리오 {sid}")
+    print()
+
+    return 0 if all(ok for _, ok in results) else 1
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@
 ```
 
 - **호출**: AWS Lambda Function URL + Response Streaming + IAM 인증
-- **모델**: `apac.anthropic.claude-sonnet-4-20250514-v1:0` (APAC 라우팅)
+- **모델**: `global.anthropic.claude-sonnet-4-6` (최신 Sonnet 4.6)
 - **흐름**: 사용자 질문 → Tool Use 루프(도구 호출 판단) → 최종 답변 토큰 스트림
 
 ---

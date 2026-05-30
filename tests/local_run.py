@@ -1,10 +1,11 @@
 """
 Local test script — run multiple scenarios against the chatbot.
 
-Phase 4 Step 2: 시나리오 3개 차례로 실행.
+시나리오 4개 차례로 실행:
   ① 도구 호출 없음 — "이 계약서 어때?"
   ② MCP1 환율 도구 — "월급 베트남 돈으로 얼마야?"
   ③ KB 법령 도구 — "외국인도 최저임금 미달이 불법이야?"
+  ④ MCP2 커뮤니티 도구 — "비슷한 경험 한 사람 있나?"
 
 Requirements:
     - AWS credentials configured (gb-account-b 프로필 또는 default)
@@ -13,9 +14,14 @@ Requirements:
     - MCP1 환율 서버가 로컬에 떠있어야 함 (시나리오 ② 통과 위해)
         cd ../gb-mcp-servers/mcp-exchange
         source .venv/Scripts/activate
-        export REDIS_HOST=10.10.1.194
-        export REDIS_PORT=6379
-        export REDIS_PASSWORD=sbredis1234
+        export REDIS_HOST=10.10.1.194 REDIS_PORT=6379 REDIS_PASSWORD=sbredis1234
+        python server.py    # 8000 포트
+    - MCP2 커뮤니티 서버가 로컬에 떠있어야 함 (시나리오 ④ 통과 위해)
+        cd ../gb-mcp-servers/mcp-community
+        source .venv/Scripts/activate
+        export COMMUNITY_DB_HOST=10.10.1.193 COMMUNITY_DB_USER=community_user \
+               COMMUNITY_DB_PASSWORD=sbcommunity1234 COMMUNITY_DB_NAME=community_db
+        # MCP1과 동시 띄울 때는 포트 충돌 방지: 8001로 띄우거나 MCP1을 끄기
         python server.py
 
 Usage:
@@ -23,7 +29,7 @@ Usage:
     python -m tests.local_run
 
     # 특정 시나리오만 실행:
-    python -m tests.local_run --only 2
+    python -m tests.local_run --only 4
 """
 import argparse
 import logging
@@ -72,6 +78,12 @@ SCENARIOS = [
         "message": "외국인도 최저임금 미달이 법적으로 문제가 돼?",
         "expected_tools": ["search_legal_standard"],
     },
+    {
+        "id": 4,
+        "name": "시나리오 ④ — MCP2 커뮤니티 검색 도구 호출",
+        "message": "최저임금도 못 받고 일하는 비슷한 사람 있나? 다들 어떻게 했어?",
+        "expected_tools": ["search_community_posts"],
+    },
 ]
 
 
@@ -101,8 +113,8 @@ def run_scenario(scenario: dict) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run chatbot scenarios locally.")
     parser.add_argument(
-        "--only", type=int, choices=[1, 2, 3], default=None,
-        help="특정 시나리오만 실행 (1, 2, 3 중 하나). 미지정 시 전체 실행.",
+        "--only", type=int, choices=[1, 2, 3, 4], default=None,
+        help="특정 시나리오만 실행 (1~4 중 하나). 미지정 시 전체 실행.",
     )
     parser.add_argument(
         "--delay", type=float, default=1.5,

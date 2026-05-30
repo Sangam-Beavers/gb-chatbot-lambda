@@ -1,9 +1,10 @@
 """
 Chatbot tools — Bedrock Tool Use 대상 도구 정의 + 실행 함수.
 
-Phase 4 Step 2에서 추가된 도구 2개:
-  1. get_exchange_rate    — MCP1 환율 서버(gb-mcp-servers)에 HTTP 호출
-  2. search_legal_standard — Bedrock Knowledge Base retrieve 호출 (유진 KB)
+도구 3개:
+  1. get_exchange_rate       — MCP1 환율 서버(gb-mcp-servers/mcp-exchange) HTTP 호출
+  2. search_legal_standard   — Bedrock Knowledge Base retrieve (유진 KB)
+  3. search_community_posts  — MCP2 커뮤니티 서버(gb-mcp-servers/mcp-community) HTTP 호출
 
 Bedrock Converse API의 toolConfig.tools 형식:
   https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html
@@ -105,6 +106,40 @@ def _get_exchange_rate(amount_krw: float, target_currency: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MCP2 커뮤니티 검색 서버 호출 (HTTP)
+# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_MCP_COMMUNITY_URL = "http://localhost:8001/mcp"
+
+
+async def _call_mcp_community_async(query: str, limit: int) -> str:
+    """MCP2 커뮤니티 서버의 search_community_posts 도구를 호출."""
+    url = os.environ.get("MCP_COMMUNITY_URL", DEFAULT_MCP_COMMUNITY_URL)
+    logger.info("MCP community call: url=%s query=%r limit=%d", url, query, limit)
+
+    try:
+        async with streamablehttp_client(url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "search_community_posts",
+                    arguments={"query": query, "limit": limit},
+                )
+                if result.content and len(result.content) > 0:
+                    first = result.content[0]
+                    if hasattr(first, "text") and first.text:
+                        return first.text
+                return "커뮤니티 검색 결과를 받지 못했습니다."
+    except Exception as e:
+        logger.error("MCP community call failed: %s", e)
+        return f"커뮤니티 검색 서버 호출 중 오류가 발생했습니다: {type(e).__name__}"
+
+
+def _search_community_posts(query: str, limit: int = 3) -> str:
+    """Sync wrapper for the async MCP call."""
+    return asyncio.run(_call_mcp_community_async(query, limit))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Tool 정의 (Bedrock Converse API toolSpec)
 # ──────────────────────────────────────────────────────────────────────────────
 TOOLS = [
@@ -163,6 +198,48 @@ TOOLS = [
             },
         }
     },
+    {
+        "toolSpec": {
+            "name": "search_community_posts",
+            "description": (
+                "외국인 노동자 커뮤니티에서 사용자 질문과 비슷한 경험을 가진 다른 사용자의 "
+                "게시글과 댓글을 검색합니다. 게시글 제목/본문/댓글 전부에서 키워드를 매칭하며, "
+                "관련 글의 카테고리·본문 일부·주요 댓글이 함께 반환됩니다. "
+                "공감과 실전 조언을 제공해야 하는 상황(임금 체불·미달, 비자·체류, 계약서, "
+                "초과근무, 외국인근로자 권리 등)에서 사용하세요. "
+                "예: '비슷한 경험 한 사람 있나?', '다른 사람들은 어떻게 했어?', "
+                "'이런 상황 겪어본 사람?'"
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "⚠️ 반드시 짧은 핵심 키워드 1~2단어로만 입력. "
+                                "긴 자연어 문장이나 조사·어미가 붙은 표현은 매칭률이 떨어집니다. "
+                                "여러 단어를 넣으면 공백 기준으로 OR 매칭됩니다.\n"
+                                "\n"
+                                "✅ 좋은 예: '최저임금', '임금체불', '주52시간', '계약서', "
+                                "'E-9 비자', '사업장 변경'\n"
+                                "❌ 나쁜 예: '최저임금 미달 임금 적게 받음', "
+                                "'최저임금 못 받았어요', '임금이 체불됐는데 어떻게 신고하나요'"
+                            ),
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": (
+                                "반환할 게시글 수 (기본 3, 최대 10). "
+                                "글 1개당 본문 일부 + 댓글 최대 5개가 함께 포함됩니다."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                }
+            },
+        }
+    },
 ]
 
 
@@ -178,5 +255,11 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
     if tool_name == "search_legal_standard":
         return _search_legal_standard(query=str(tool_input.get("query", "")))
+
+    if tool_name == "search_community_posts":
+        return _search_community_posts(
+            query=str(tool_input.get("query", "")),
+            limit=int(tool_input.get("limit", 3)),
+        )
 
     return f"Unknown tool: {tool_name}"

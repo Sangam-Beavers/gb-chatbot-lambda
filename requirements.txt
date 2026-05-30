@@ -3,5 +3,11 @@
 # AWS SDK (Bedrock Runtime + Bedrock Agent Runtime for KB)
 boto3>=1.34.0
 
-# Anthropic MCP Python SDK (client for MCP1 exchange server)
+# Anthropic MCP Python SDK (client for MCP1 exchange / MCP2 community)
 mcp>=1.0.0
+
+# HTTP entry point (AWS Lambda Web Adapter + FastAPI 패턴)
+# - app.py가 Spring 백엔드로부터 POST를 받아 chat_once 토큰을 SSE로 흘림
+# - Lambda Web Adapter extension이 Function URL을 ASGI로 어댑팅
+fastapi>=0.110.0
+uvicorn>=0.27.0

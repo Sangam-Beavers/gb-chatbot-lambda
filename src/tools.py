@@ -1,10 +1,16 @@
 """
 Chatbot tools — Bedrock Tool Use 대상 도구 정의 + 실행 함수.
 
-도구 3개:
-  1. get_exchange_rate       — MCP1 환율 서버(gb-mcp-servers/mcp-exchange) HTTP 호출
-  2. search_legal_standard   — Bedrock Knowledge Base retrieve (유진 KB)
-  3. search_community_posts  — MCP2 커뮤니티 서버(gb-mcp-servers/mcp-community) HTTP 호출
+도구 4개:
+  1. get_exchange_rate       — MCP1 환율 서버(gb-mcp-servers/mcp-exchange) HTTP 호출 (같은 회사 다른 팀)
+  2. search_legal_standard   — Bedrock Knowledge Base retrieve (유진 KB, 우리 도메인)
+  3. search_community_posts  — MCP2 커뮤니티 서버(gb-mcp-servers/mcp-community) HTTP 호출 (같은 회사 다른 팀)
+  4. search_web              — MCP3 Tavily Remote MCP Server (외부 회사 직접 연결) — 실시간 웹 검색
+
+특이사항:
+  - search_web 은 Tavily 가 운영하는 외부 공식 MCP 서버(https://mcp.tavily.com/mcp/) 에
+    챗봇이 클라이언트로 직접 붙는 구조. 자체 어댑터 서버를 거치지 않음.
+  - 발표 narrative: MCP 본래 가치(외부 회사 시스템을 표준 인터페이스로 통합)의 정면 사례.
 
 Bedrock Converse API의 toolConfig.tools 형식:
   https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html
@@ -140,6 +146,76 @@ def _search_community_posts(query: str, limit: int = 3) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MCP3 Tavily Remote MCP Server 호출 (외부 회사 직접 연결)
+# ──────────────────────────────────────────────────────────────────────────────
+# Tavily 가 운영하는 공식 Remote MCP Server. 챗봇 Lambda 가 클라이언트로 직접 붙는다.
+# 자체 어댑터 서버를 거치지 않음 — MCP 본래 가치(외부 시스템 표준 통합)의 정면 사례.
+#
+# Transport : Streamable HTTP (Lambda 환경에 적합, stdio 불필요)
+# 인증      : Authorization: Bearer <TAVILY_API_KEY>  (URL 쿼리 노출 회피)
+# 노출 도구 : tavily_search, tavily_extract, tavily_crawl, tavily_map, tavily_research
+#             — 우리는 그중 tavily_search 만 사용 (시연 시나리오 ⑤ 충분).
+#             — Bedrock toolSpec 이름은 [a-zA-Z][a-zA-Z0-9_]* 만 허용하므로
+#               외부 표시는 search_web 으로 두고 내부에서 tavily_search 로 매핑.
+#             — 주의: Tavily docs 페이지엔 'tavily-search' (hyphen) 로 적혀있으나
+#               실제 list_tools 응답은 'tavily_search' (underscore). 실측 기준 박음.
+# 무료 quota: Researcher Plan 월 1,000 search (시연용 충분).
+# Docs      : https://docs.tavily.com/documentation/mcp
+DEFAULT_TAVILY_MCP_URL = "https://mcp.tavily.com/mcp/"
+
+
+async def _call_tavily_search_async(query: str, max_results: int) -> str:
+    """외부 Tavily Remote MCP Server의 tavily-search 도구를 호출."""
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        logger.warning("TAVILY_API_KEY 환경변수가 비어있음 — 웹 검색 호출 스킵")
+        return "Tavily API 키가 설정되지 않아 웹 검색을 수행할 수 없습니다."
+
+    url = os.environ.get("TAVILY_MCP_URL", DEFAULT_TAVILY_MCP_URL)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    logger.info("Tavily MCP call: url=%s query=%r max_results=%d", url, query, max_results)
+
+    try:
+        async with streamablehttp_client(url, headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "tavily_search",
+                    arguments={
+                        "query": query,
+                        "max_results": max_results,
+                    },
+                )
+
+                # Tavily MCP는 도구 실행 실패 시 isError=True + 에러 메시지 텍스트로 응답.
+                # 디버깅이 필요하면 logger.debug로 (운영 정상 호출에서 검색 결과 본문이
+                # CloudWatch에 그대로 남는 걸 피하기 위해 INFO에서는 메타정보만).
+                logger.info(
+                    "Tavily response: isError=%s, content_count=%d",
+                    getattr(result, "isError", None),
+                    len(result.content) if result.content else 0,
+                )
+
+                # 모든 text 블록을 하나로 합쳐서 반환 (Tavily가 여러 블록으로 줄 수 있음)
+                texts = []
+                for item in (result.content or []):
+                    t = getattr(item, "text", None)
+                    if t:
+                        texts.append(t)
+                if texts:
+                    return "\n\n".join(texts)
+                return "웹 검색 결과를 받지 못했습니다."
+    except Exception as e:
+        logger.error("Tavily MCP call failed: %s", e)
+        return f"웹 검색 중 오류가 발생했습니다: {type(e).__name__}"
+
+
+def _search_web(query: str, max_results: int = 5) -> str:
+    """Sync wrapper for the async Tavily Remote MCP call."""
+    return asyncio.run(_call_tavily_search_async(query, max_results))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Tool 정의 (Bedrock Converse API toolSpec)
 # ──────────────────────────────────────────────────────────────────────────────
 TOOLS = [
@@ -240,6 +316,46 @@ TOOLS = [
             },
         }
     },
+    {
+        "toolSpec": {
+            "name": "search_web",
+            "description": (
+                "최신 외부 웹 정보를 실시간으로 검색합니다. 모델이 학습 시점에 모르거나 "
+                "시기성이 강한 정보(올해/최근의 최저임금·정책·고시, 공공기관 공지, 비자 "
+                "정책 변경, 외국인 고용 관련 최신 가이드 등) 를 사용자가 물을 때 사용하세요. "
+                "내부적으로는 Tavily 가 운영하는 외부 공식 MCP 서버를 통해 웹 검색 결과를 "
+                "받아옵니다. 법령 조항(정적·확정)은 search_legal_standard, 커뮤니티 글은 "
+                "search_community_posts, 단순 환산은 get_exchange_rate 가 더 적절합니다.\n"
+                "\n"
+                "예: '올해 한국 외국인 최저임금 얼마야?', "
+                "'2026년 외국인 고용허가제 변경사항?', "
+                "'산업안전공단 신고 방법?', '최근 E-9 비자 정책 업데이트?'"
+            ),
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "웹에서 검색할 자연어 질의. 한국어 가능. "
+                                "필요하면 연도/지역 같은 한정자를 포함해 정확도를 높이세요.\n"
+                                "예: '2026년 한국 최저임금', '한국 외국인 근로자 고용허가제'"
+                            ),
+                        },
+                        "max_results": {
+                            "type": "number",
+                            "description": (
+                                "반환할 결과 수 (기본 5, 권장 3~7). "
+                                "큰 값은 응답 시간을 늘립니다."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                }
+            },
+        }
+    },
 ]
 
 
@@ -260,6 +376,12 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return _search_community_posts(
             query=str(tool_input.get("query", "")),
             limit=int(tool_input.get("limit", 3)),
+        )
+
+    if tool_name == "search_web":
+        return _search_web(
+            query=str(tool_input.get("query", "")),
+            max_results=int(tool_input.get("max_results", 5)),
         )
 
     return f"Unknown tool: {tool_name}"

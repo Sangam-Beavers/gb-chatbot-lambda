@@ -1,11 +1,12 @@
 """
 Local test script — run multiple scenarios against the chatbot.
 
-시나리오 4개 차례로 실행:
+시나리오 5개 차례로 실행:
   ① 도구 호출 없음 — "이 계약서 어때?"
   ② MCP1 환율 도구 — "월급 베트남 돈으로 얼마야?"
   ③ KB 법령 도구 — "외국인도 최저임금 미달이 불법이야?"
   ④ MCP2 커뮤니티 도구 — "비슷한 경험 한 사람 있나?"
+  ⑤ MCP3 Tavily 웹 검색 (외부 회사 직접 연결) — "올해 한국 외국인 최저임금 얼마야?"
 
 Requirements:
     - AWS credentials configured (gb-account-b 프로필 또는 default)
@@ -23,13 +24,16 @@ Requirements:
                COMMUNITY_DB_PASSWORD=sbcommunity1234 COMMUNITY_DB_NAME=community_db
         # MCP1과 동시 띄울 때는 포트 충돌 방지: 8001로 띄우거나 MCP1을 끄기
         python server.py
+    - Tavily API 키 환경변수 (시나리오 ⑤ 통과 위해) — 외부 서버라 로컬 서버 안 띄움
+        export TAVILY_API_KEY=tvly-...    # https://app.tavily.com/home 에서 발급
+        # (선택) export TAVILY_MCP_URL=https://mcp.tavily.com/mcp/
 
 Usage:
     cd gb-chatbot-lambda
     python -m tests.local_run
 
     # 특정 시나리오만 실행:
-    python -m tests.local_run --only 4
+    python -m tests.local_run --only 5
 """
 import argparse
 import logging
@@ -84,6 +88,12 @@ SCENARIOS = [
         "message": "최저임금도 못 받고 일하는 비슷한 사람 있나? 다들 어떻게 했어?",
         "expected_tools": ["search_community_posts"],
     },
+    {
+        "id": 5,
+        "name": "시나리오 ⑤ — MCP3 외부 Tavily 웹 검색 도구 호출 (외부 회사 직접 연결)",
+        "message": "올해 한국 외국인 최저임금 얼마야?",
+        "expected_tools": ["search_web"],
+    },
 ]
 
 
@@ -113,8 +123,8 @@ def run_scenario(scenario: dict) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run chatbot scenarios locally.")
     parser.add_argument(
-        "--only", type=int, choices=[1, 2, 3, 4], default=None,
-        help="특정 시나리오만 실행 (1~4 중 하나). 미지정 시 전체 실행.",
+        "--only", type=int, choices=[1, 2, 3, 4, 5], default=None,
+        help="특정 시나리오만 실행 (1~5 중 하나). 미지정 시 전체 실행.",
     )
     parser.add_argument(
         "--delay", type=float, default=1.5,

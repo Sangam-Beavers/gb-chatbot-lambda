@@ -87,6 +87,40 @@ python -m tests.local_run
 - `bedrock:Converse` / `bedrock:ConverseStream`
 - `bedrock:Retrieve` (3단계, 법령 KB)
 - `lambda:InvokeFunctionUrl` (백엔드 측 권한 — 백엔드 롤에 부여)
+- `dynamodb:Query` / `dynamodb:PutItem` / `dynamodb:BatchWriteItem` — `chat_sessions` 테이블 ARN 한정 (대화기록, 아래 참고)
+
+---
+
+## 대화기록 영속화 — DynamoDB `chat_sessions`
+
+> 정본: `gb-backend/docs/document-analysis/ai-chatbot-mcp.md` §3-4/§3-5/§7. 코드: `src/storage.py`.
+
+- 스레드 정체성 = `(user_public_id, document_public_id)`. session_id는 로깅용 메타.
+- 환경변수 **`DYNAMODB_TABLE_NAME`** 미설정 시 영속화가 조용히 꺼진다(로컬 `tests/local_run.py`는 그대로 동작).
+- 첫 턴에 주입한 합성 요약 2턴도 `visible=false`로 저장 — 복구 시 요약 유실 방지.
+
+### 테이블 생성 (계정 B, 1회)
+
+```bash
+aws dynamodb create-table \
+  --table-name chat_sessions \
+  --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
+  --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST \
+  --region ap-northeast-2
+
+# TTL 활성화 (90일 자동 삭제 — PII 보관기간)
+aws dynamodb update-time-to-live \
+  --table-name chat_sessions \
+  --time-to-live-specification "Enabled=true, AttributeName=ttl" \
+  --region ap-northeast-2
+```
+
+### 단위 테스트
+
+```bash
+python -m tests.test_storage    # DynamoDB Mock — AWS 자격증명 불필요
+```
 
 ---
 

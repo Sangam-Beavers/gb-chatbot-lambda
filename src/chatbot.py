@@ -16,6 +16,7 @@ from typing import Generator, Optional
 
 import boto3
 
+from src.storage import build_context_turns
 from src.system_prompt import build_system_prompt
 from src.tools import TOOLS, execute_tool
 
@@ -29,6 +30,13 @@ DEFAULT_REGION = "ap-northeast-2"
 # Tool Use 루프 최대 반복 횟수 (도구 4번까지 + 마지막 end_turn = 5)
 MAX_TOOL_USE_ITERATIONS = 5
 
+# 슬라이딩 윈도우 — Bedrock에 보내는 messages 상한(≈20턴). 합성 요약 2턴은 고정 보존.
+# 정본 §8/§10 — Summary Worker 확장 전 데모 처리.
+MAX_WINDOW_MESSAGES = 40
+
+# 합성 요약 턴 식별 마커 (storage.build_context_turns와 동일 텍스트)
+_CONTEXT_MARKER = "[분석된 계약서 요약]"
+
 # 시뮬레이션 스트리밍 지연 (per character, 영상에서 점진 표시 효과)
 STREAM_CHAR_DELAY = 0.005
 
@@ -40,20 +48,66 @@ def _get_bedrock_client():
     )
 
 
+def _is_plain_user_text(msg: dict) -> bool:
+    """일반 user 텍스트 메시지인가 — toolResult(role=user지만 content가 toolResult 블록)는 제외."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content") or []
+    return bool(content) and "text" in content[0]
+
+
+def _apply_sliding_window(messages: list) -> None:
+    """messages가 상한을 넘으면 최근 턴만 남긴다 — **in-place** 수정.
+
+    in-place인 이유: app.py가 같은 리스트 참조를 들고 있다가 턴 종료 후 Redis에 캐시하므로,
+    새 리스트로 갈아끼우면 이후 누적 턴이 캐시에서 빠진다.
+
+    규칙(정본 §8):
+    - 합성 요약 2턴(맨 앞, [분석된 계약서 요약] 마커)은 고정 보존 — 분석 맥락 유실 방지.
+    - 잘린 구간 시작이 toolResult/assistant면 일반 user 텍스트 메시지까지 전진해
+      toolUse↔toolResult pair가 깨지지 않게 한다(깨지면 Bedrock 400).
+    """
+    if len(messages) <= MAX_WINDOW_MESSAGES:
+        return
+
+    pinned = []
+    rest = messages
+    first_text = (messages[0].get("content") or [{}])[0].get("text", "") if messages else ""
+    if _CONTEXT_MARKER in first_text:
+        pinned = messages[:2]
+        rest = messages[2:]
+
+    tail = rest[len(rest) - (MAX_WINDOW_MESSAGES - len(pinned)):]
+    while tail and not _is_plain_user_text(tail[0]):
+        tail = tail[1:]
+    if not tail:  # 비정상적으로 긴 단일 턴 — 최소한 마지막 메시지는 유지
+        tail = rest[-1:]
+
+    trimmed = pinned + tail
+    logger.info("Sliding window applied: %d → %d messages", len(messages), len(trimmed))
+    messages[:] = trimmed
+
+
 def chat_once(
     message: str,
     analysis_summary: Optional[str] = None,
     user_lang: str = "ko",
     model_id: Optional[str] = None,
+    messages: Optional[list] = None,
+    tools_used_out: Optional[list] = None,
 ) -> Generator[str, None, None]:
     """
     Stream tokens for a single user message, with optional tool use.
 
     Args:
         message: 사용자 질문
-        analysis_summary: 분석 요약 (첫 turn에만 주입)
+        analysis_summary: 분석 요약 (첫 turn에만 주입 — messages 미전달 시에만 사용)
         user_lang: 답변 언어 코드 (데모는 'ko')
         model_id: Bedrock inference profile ID (기본 Sonnet 4.6)
+        messages: 복원된 스레드 (storage.load_thread 결과). 전달되면 이 위에 user 질문을
+            누적하고 analysis_summary는 무시한다 — 요약은 이미 스레드 안에 있다(§3-2).
+            None이면 단일턴 모드(로컬 테스트 호환): 요약 합성 2턴부터 새로 조립.
+        tools_used_out: 이번 턴에 호출된 도구명을 담아 돌려줄 리스트 (저장용 메타, 선택)
 
     Yields:
         텍스트 토큰 (글자 단위, end_turn 턴의 텍스트만 흘림 - R2)
@@ -72,33 +126,22 @@ def chat_once(
     )
 
     # ──────────────────────────────────────────────────────────────────────────
-    # messages 초기 조립 (Step 1과 동일)
+    # messages 조립 — 복원 스레드(load_thread) 위에 누적하거나, 단일턴 모드로 새로 조립
     # ──────────────────────────────────────────────────────────────────────────
-    messages = []
-    if analysis_summary:
-        messages.append({
-            "role": "user",
-            "content": [{
-                "text": (
-                    f"[분석된 계약서 요약]\n"
-                    f"{analysis_summary}\n\n"
-                    f"위 계약서에 대해 질문하겠습니다."
-                )
-            }]
-        })
-        messages.append({
-            "role": "assistant",
-            "content": [{"text": "네, 확인했습니다. 궁금한 점을 물어보세요."}]
-        })
+    if messages is None:
+        messages = build_context_turns(analysis_summary) if analysis_summary else []
 
     messages.append({
         "role": "user",
         "content": [{"text": message}]
     })
 
+    # 긴 스레드는 최근 턴만 — 합성 요약 고정 + 윈도우 (in-place, §8)
+    _apply_sliding_window(messages)
+
     logger.info(
-        "Chat start: model=%s, has_summary=%s, message_len=%d",
-        chosen_model, analysis_summary is not None, len(message),
+        "Chat start: model=%s, history_turns=%d, message_len=%d",
+        chosen_model, len(messages) - 1, len(message),
     )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -218,6 +261,8 @@ def chat_once(
                         "Tool call: name=%s input=%s",
                         cb["name"], cb["input"],
                     )
+                    if tools_used_out is not None:
+                        tools_used_out.append(cb["name"])
                     result_text = execute_tool(cb["name"], cb["input"])
                     tool_results.append({
                         "toolResult": {

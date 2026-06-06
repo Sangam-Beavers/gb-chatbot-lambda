@@ -3,6 +3,10 @@
 # AWS SDK (Bedrock Runtime + Bedrock Agent Runtime for KB)
 boto3>=1.34.0
 
+# 대화 스레드 캐시 (chat:thread:{user}:{doc}, TTL 30분 — ai-chatbot-mcp.md §3-4)
+# REDIS_HOST 미설정이면 캐시만 꺼지고 DynamoDB 단독으로 동작한다.
+redis>=5.0.0
+
 # Anthropic MCP Python SDK (client for MCP1 exchange / MCP2 community)
 mcp>=1.0.0
 

@@ -39,6 +39,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from src.chatbot import chat_once
+from src.storage import cache_thread, fetch_history, load_thread, save_turn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +57,33 @@ app = FastAPI(
 def health():
     """헬스체크 — Function URL이 살아있는지 확인용. 인증 불필요한 경량 응답."""
     return {"status": "ok"}
+
+
+@app.get("/history")
+def history(
+    user_public_id: str = "",
+    document_public_id: str = "",
+    limit: int = 50,
+    cursor: str = None,
+):
+    """대화 이력 조회 — 재방문 복원용 (ai-chatbot-mcp.md §6-2). 비스트리밍 JSON.
+
+    백엔드 전용 내부 라우트 — Spring이 인증·문서 소유자 검증을 마친 뒤 IAM SigV4로
+    릴레이한다(Function URL 자체가 IAM 인증이라 인터넷 비노출). 여기서 인가를 다시 하지 않는다.
+
+    Response: {"messages": [{"role", "content", "created_at"}], "next_cursor": str|null}
+        visible=true 턴만 시간 오름차순 — 합성 요약 턴은 노출되지 않는다.
+    """
+    logger.info(
+        "history request: doc=%s user=%s limit=%d cursor=%s",
+        document_public_id, user_public_id, limit, cursor is not None,
+    )
+    return fetch_history(
+        user_public_id=user_public_id,
+        document_public_id=document_public_id,
+        limit=limit,
+        cursor=cursor,
+    )
 
 
 @app.post("/")
@@ -90,6 +118,7 @@ async def chat_endpoint(request: Request):
     analysis_summary = payload.get("analysis_summary")
     document_public_id = payload.get("document_public_id", "")
     user_public_id = payload.get("user_public_id", "")
+    environment = payload.get("environment", "dev")
 
     logger.info(
         "chat request: session=%s doc=%s user=%s lang=%s msg_len=%d has_summary=%s",
@@ -97,17 +126,42 @@ async def chat_endpoint(request: Request):
         len(message), analysis_summary is not None,
     )
 
+    # 스레드 복원 (ai-chatbot-mcp.md §3-4/§3-5) — 스레드 정체성 = (user, document).
+    # 기존 스레드가 있으면 백엔드가 보낸 analysis_summary는 무시된다(중복 주입 방지 — §6).
+    messages, inject_context = load_thread(user_public_id, document_public_id, analysis_summary)
+
     def sse_stream():
         """chat_once의 토큰 generator를 SSE 프레임으로 변환."""
+        reply_parts = []
+        tools_used = []
         try:
             for token in chat_once(
                 message=message,
-                analysis_summary=analysis_summary,
                 user_lang=user_lang,
+                messages=messages,
+                tools_used_out=tools_used,
             ):
+                reply_parts.append(token)
                 # SSE 스펙: data 안의 \n은 멀티라인 의미라 이스케이프해서 한 줄로
                 escaped = token.replace("\n", "\\n")
                 yield f"event: token\ndata: {escaped}\n\n"
+
+            # 턴 종료 저장 (§3-4 2계층 — 실패해도 raise 안 함)
+            # Redis: toolUse 블록 포함 messages 통째 (chat_once가 in-place로 누적해 둠), TTL 30분 갱신
+            cache_thread(user_public_id, document_public_id, messages)
+            # DynamoDB: 텍스트 턴만 (§7 — 첫 대화면 합성 2턴 포함 4건, 이후 2건)
+            save_turn(
+                user_public_id=user_public_id,
+                document_public_id=document_public_id,
+                session_id=session_id,
+                environment=environment,
+                language=user_lang,
+                user_message=message,
+                assistant_reply="".join(reply_parts),
+                tools_used=tools_used,
+                analysis_summary=analysis_summary,
+                inject_context=inject_context,
+            )
 
             done_payload = json.dumps({"session_id": session_id})
             yield f"event: done\ndata: {done_payload}\n\n"

@@ -23,9 +23,10 @@ FROM public.ecr.aws/lambda/python:3.12
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 
-# src/ 디렉터리 내용을 LAMBDA_TASK_ROOT 루트로 평탄화 복사
-# (zip 배포 패턴과 일치 — 핸들러 경로 translator_handler.handler 유지)
-COPY src/ ${LAMBDA_TASK_ROOT}/
+# src/ 디렉터리를 그대로 LAMBDA_TASK_ROOT 아래에 둔다.
+# (Python 코드가 `from src.translator import ...` 형태로 import하므로
+#  평탄화하지 않고 src/ 패키지 구조를 유지해야 함. 핸들러 경로도 src. prefix.)
+COPY src/ ${LAMBDA_TASK_ROOT}/src/
 
-# 핸들러 지정
-CMD ["translator_handler.handler"]
+# 핸들러 지정 — src 패키지 안의 translator_handler.handler
+CMD ["src.translator_handler.handler"]

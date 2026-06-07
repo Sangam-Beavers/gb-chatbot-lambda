@@ -25,6 +25,8 @@ Thumbs.db
 
 # 테스트 / 로컬 검증 — Lambda 런타임 불필요
 tests/
+.pytest_cache/
+pytest-cache-files-*/
 
 # Git
 .git/
@@ -38,3 +40,4 @@ README.md
 *.zip
 build/
 dist/
+.aws-sam/

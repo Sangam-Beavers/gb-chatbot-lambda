@@ -1,0 +1,18 @@
+# 이미지에 안 들어갈 파일들
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+pytest-cache-files-*/
+.git/
+.gitignore
+README.md
+.env
+.env.example
+tests/
+*.zip
+build/
+.aws-sam/
+.vscode/
+.idea/

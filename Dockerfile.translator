@@ -1,0 +1,31 @@
+# gb-community-translator Lambda (컨테이너 이미지 배포).
+#
+# - 베이스: AWS Lambda Python 3.12 공식 이미지 (RIE 내장).
+# - 의존성: boto3는 베이스 이미지에 이미 포함되지만, 버전 고정 안정성을 위해
+#   requirements.txt를 명시적으로 설치한다.
+# - 핸들러: translator_handler.handler  (src/ 디렉터리를 LAMBDA_TASK_ROOT 루트로 평탄화)
+#
+# 빌드:
+#   docker build -f Dockerfile.translator -t gb-community-translator:latest .
+#
+# 로컬 invoke 테스트:
+#   docker run --rm -p 9000:8080 \
+#     -e BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6 \
+#     -e BEDROCK_REGION=ap-northeast-2 \
+#     -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
+#     gb-community-translator:latest
+#   curl "http://localhost:9000/2015-03-31/functions/function/invocations" \
+#     -d '{"body":"{\"kind\":\"post\",\"public_id\":\"x\",\"title\":\"테스트\",\"content\":\"안녕\",\"source_lang\":\"ko\",\"target_lang\":\"vi\"}"}'
+
+FROM public.ecr.aws/lambda/python:3.12
+
+# requirements 먼저 복사 → 의존성 레이어 캐시 활용
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+# src/ 디렉터리 내용을 LAMBDA_TASK_ROOT 루트로 평탄화 복사
+# (zip 배포 패턴과 일치 — 핸들러 경로 translator_handler.handler 유지)
+COPY src/ ${LAMBDA_TASK_ROOT}/
+
+# 핸들러 지정
+CMD ["translator_handler.handler"]

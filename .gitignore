@@ -41,3 +41,4 @@ logs/
 # 기타
 *.swp
 *.swo
+pytest-cache-files-*/

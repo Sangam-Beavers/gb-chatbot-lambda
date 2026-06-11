@@ -37,8 +37,24 @@ MAX_WINDOW_MESSAGES = 40
 # 합성 요약 턴 식별 마커 (storage.build_context_turns와 동일 텍스트)
 _CONTEXT_MARKER = "[분석된 계약서 요약]"
 
-# 시뮬레이션 스트리밍 지연 (per character, 영상에서 점진 표시 효과)
-STREAM_CHAR_DELAY = 0.005
+# 토큰당 인공 지연. 0 = 지연 없음(권장). 점진 표시는 STREAM_LIVE 실시간 스트리밍으로 달성.
+STREAM_CHAR_DELAY = 0.0
+
+# 실시간 스트리밍 — 토큰 델타를 받는 즉시 흘린다(True 권장).
+# 도구 턴 lead-in 텍스트 노출을 엄격히 막아야 하면 False(지연 제거 효과는 유지).
+STREAM_LIVE = True
+
+
+def _emit(text: str):
+    """STREAM_LIVE=False 경로용. 지연 0이면 통째로, 아니면 글자 단위."""
+    if not text:
+        return
+    if STREAM_CHAR_DELAY > 0:
+        for ch in text:
+            yield ch
+            time.sleep(STREAM_CHAR_DELAY)
+    else:
+        yield text
 
 
 def _get_bedrock_client():
@@ -165,11 +181,14 @@ def chat_once(
         content_blocks = []
         current_block: Optional[dict] = None
         stop_reason: Optional[str] = None
+        turn_has_tooluse = False   # 이 턴에서 toolUse 블록을 봤는가 (R2 억제 판단)
+        streamed_live = False      # 이 턴 텍스트를 실시간으로 이미 흘렸는가
 
         for event in response["stream"]:
             if "contentBlockStart" in event:
                 start = event["contentBlockStart"]["start"]
                 if "toolUse" in start:
+                    turn_has_tooluse = True  # 도구 턴 — 이후 텍스트 실시간 억제
                     current_block = {
                         "type": "toolUse",
                         "toolUseId": start["toolUse"]["toolUseId"],
@@ -188,6 +207,10 @@ def chat_once(
                         current_block = {"type": "text", "text": ""}
                     if current_block.get("type") == "text":
                         current_block["text"] += delta["text"]
+                        # 도구 턴이 아니면 받는 즉시 흘린다 (R2: 도구 턴은 억제)
+                        if STREAM_LIVE and not turn_has_tooluse:
+                            yield delta["text"]
+                            streamed_live = True
                 elif "toolUse" in delta:
                     if current_block and current_block.get("type") == "toolUse":
                         current_block["input_json"] += delta["toolUse"].get("input", "")
@@ -243,16 +266,16 @@ def chat_once(
         # 종료 조건 + 분기
         # ──────────────────────────────────────────────────────────────────
         if stop_reason == "end_turn":
-            # R2: end_turn 턴의 텍스트만 사용자에게 흘림
-            for cb in content_blocks:
-                if cb["type"] == "text":
-                    for char in cb["text"]:
-                        yield char
-                        if STREAM_CHAR_DELAY > 0:
-                            time.sleep(STREAM_CHAR_DELAY)
+            # R2: end_turn 텍스트만 노출. STREAM_LIVE면 이미 실시간으로 흘렸으니 재전송 금지.
+            if not streamed_live:
+                for cb in content_blocks:
+                    if cb["type"] == "text":
+                        yield from _emit(cb["text"])
             return
 
         if stop_reason == "tool_use":
+            if streamed_live:
+                logger.warning("STREAM_LIVE: tool_use 턴 lead-in 노출(엄격 억제는 STREAM_LIVE=False)")
             # 도구 실행 + 결과를 messages에 추가 → 다음 iteration
             tool_results = []
             for cb in content_blocks:
@@ -281,12 +304,10 @@ def chat_once(
 
         # 그 외 stop reason (max_tokens, stop_sequence 등) — 누적 텍스트만 yield
         logger.warning("Unexpected stopReason: %s", stop_reason)
-        for cb in content_blocks:
-            if cb["type"] == "text":
-                for char in cb["text"]:
-                    yield char
-                    if STREAM_CHAR_DELAY > 0:
-                        time.sleep(STREAM_CHAR_DELAY)
+        if not streamed_live:
+            for cb in content_blocks:
+                if cb["type"] == "text":
+                    yield from _emit(cb["text"])
         return
 
     # 루프 한도 초과 — 안전 메시지

@@ -44,6 +44,12 @@ STREAM_CHAR_DELAY = 0.0
 # 도구 턴 lead-in 텍스트 노출을 엄격히 막아야 하면 False(지연 제거 효과는 유지).
 STREAM_LIVE = True
 
+# 프롬프트 캐싱 — system+도구 정의(고정 prefix)를 캐시해 도구 루프 반복 호출의
+# 입력 토큰 재처리·비용·지연을 줄인다. Sonnet 4.6 최소 1,024토큰/체크포인트이고
+# 우리 prefix(system+도구4)는 ~2K로 충족. ap-northeast-2는 global 추론 프로파일로 지원.
+# tools 배열 끝에 cachePoint 1개 → system+도구가 캐시됨(Claude 간소화 캐시 관리).
+PROMPT_CACHING = True
+
 
 def _emit(text: str):
     """STREAM_LIVE=False 경로용. 지연 0이면 통째로, 아니면 글자 단위."""
@@ -111,6 +117,7 @@ def chat_once(
     model_id: Optional[str] = None,
     messages: Optional[list] = None,
     tools_used_out: Optional[list] = None,
+    usage_out: Optional[list] = None,
 ) -> Generator[str, None, None]:
     """
     Stream tokens for a single user message, with optional tool use.
@@ -166,11 +173,16 @@ def chat_once(
     for iteration in range(MAX_TOOL_USE_ITERATIONS):
         logger.info("Tool use loop iteration %d", iteration + 1)
 
+        # 프롬프트 캐싱: tools 끝에 cachePoint를 붙여 system+도구(고정 prefix)를 캐시.
+        # TOOLS는 공유 상수라 mutate 금지 — concat으로 새 리스트 생성.
+        tool_list = (
+            TOOLS + [{"cachePoint": {"type": "default"}}] if PROMPT_CACHING else TOOLS
+        )
         response = bedrock.converse_stream(
             modelId=chosen_model,
             messages=messages,
             system=[{"text": build_system_prompt(user_lang)}],
-            toolConfig={"tools": TOOLS},
+            toolConfig={"tools": tool_list},
             inferenceConfig={
                 "maxTokens": 2048,
                 "temperature": 0.3,  # 사실 기반 답변, 보수적
@@ -237,10 +249,15 @@ def chat_once(
 
             elif "metadata" in event:
                 usage = event["metadata"].get("usage", {})
+                if usage_out is not None:
+                    usage_out.append(dict(usage))
                 logger.info(
-                    "Iteration %d done: stopReason=%s, in=%s, out=%s",
+                    "Iteration %d done: stopReason=%s, in=%s, out=%s, "
+                    "cache_read=%s, cache_write=%s",
                     iteration + 1, stop_reason,
                     usage.get("inputTokens"), usage.get("outputTokens"),
+                    usage.get("cacheReadInputTokens"),
+                    usage.get("cacheWriteInputTokens"),
                 )
 
         # ──────────────────────────────────────────────────────────────────

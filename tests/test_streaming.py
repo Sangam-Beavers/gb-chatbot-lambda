@@ -34,7 +34,7 @@ def _install_stubs():
 
     tools_stub = types.ModuleType("src.tools")
     tools_stub.TOOLS = []
-    tools_stub.execute_tool = lambda name, inp: f"[stub:{name}]"
+    tools_stub.execute_tool = lambda name, inp, env="dev": f"[stub:{name}]"
     sys.modules["src.tools"] = tools_stub
 
 

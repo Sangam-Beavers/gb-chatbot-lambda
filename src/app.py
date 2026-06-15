@@ -138,6 +138,7 @@ async def chat_endpoint(request: Request):
             for token in chat_once(
                 message=message,
                 user_lang=user_lang,
+                environment=environment,
                 messages=messages,
                 tools_used_out=tools_used,
             ):

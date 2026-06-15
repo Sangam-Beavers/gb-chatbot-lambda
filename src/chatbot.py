@@ -114,6 +114,7 @@ def chat_once(
     message: str,
     analysis_summary: Optional[str] = None,
     user_lang: str = "ko",
+    environment: str = "dev",
     model_id: Optional[str] = None,
     messages: Optional[list] = None,
     tools_used_out: Optional[list] = None,
@@ -127,6 +128,8 @@ def chat_once(
         analysis_summary: 분석 요약 (첫 turn에만 주입 — messages 미전달 시에만 사용)
         user_lang: 답변 언어 코드 (데모는 'ko')
         model_id: Bedrock inference profile ID (기본 Sonnet 4.6)
+        environment: dev/stage/prod — 자체 MCP(환율·커뮤니티) URL 라우팅에 쓰인다(§6/§9).
+            execute_tool로 그대로 전달. KB·Tavily는 환경 무관.
         messages: 복원된 스레드 (storage.load_thread 결과). 전달되면 이 위에 user 질문을
             누적하고 analysis_summary는 무시한다 — 요약은 이미 스레드 안에 있다(§3-2).
             None이면 단일턴 모드(로컬 테스트 호환): 요약 합성 2턴부터 새로 조립.
@@ -303,7 +306,7 @@ def chat_once(
                     )
                     if tools_used_out is not None:
                         tools_used_out.append(cb["name"])
-                    result_text = execute_tool(cb["name"], cb["input"])
+                    result_text = execute_tool(cb["name"], cb["input"], environment)
                     tool_results.append({
                         "toolResult": {
                             "toolUseId": cb["toolUseId"],

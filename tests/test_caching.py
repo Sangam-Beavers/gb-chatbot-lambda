@@ -29,7 +29,7 @@ def _install_stubs():
     tools_stub = types.ModuleType("src.tools")
     # 실제 도구 1개를 흉내내 cachePoint가 "도구 뒤"에 붙는지 확인
     tools_stub.TOOLS = [{"toolSpec": {"name": "dummy"}}]
-    tools_stub.execute_tool = lambda name, inp: f"[stub:{name}]"
+    tools_stub.execute_tool = lambda name, inp, env="dev": f"[stub:{name}]"
     sys.modules["src.tools"] = tools_stub
 
 

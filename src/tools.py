@@ -25,6 +25,23 @@ from mcp.client.streamable_http import streamablehttp_client
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_mcp_url(base_var: str, environment: str, default: str) -> str:
+    """환경(dev/stage/prod)별 자체 MCP URL을 해석한다.
+
+    한 Lambda가 전 환경을 공유하므로(ai-chatbot-mcp.md §9) 페이로드 environment로
+    stage/prod MCP(내부 NLB / PrivateLink endpoint)를 골라 라우팅한다.
+    우선순위: 환경별 변수(MCP_EXCHANGE_URL_STAGE 등) → 공용 변수(MCP_EXCHANGE_URL)
+             → 기본값(localhost, 로컬 테스트용).
+    """
+    env = (environment or "dev").strip().upper()
+    return (
+        os.environ.get(f"{base_var}_{env}")
+        or os.environ.get(base_var)
+        or default
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Bedrock Knowledge Base — 법령 검색 (유진이 만든 KB)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -79,9 +96,9 @@ def _search_legal_standard(query: str) -> str:
 DEFAULT_MCP_EXCHANGE_URL = "http://localhost:8000/mcp"
 
 
-async def _call_mcp_exchange_async(amount_krw: float, target_currency: str) -> str:
+async def _call_mcp_exchange_async(amount_krw: float, target_currency: str, environment: str = "dev") -> str:
     """MCP1 환율 서버의 get_exchange_rate 도구를 호출."""
-    url = os.environ.get("MCP_EXCHANGE_URL", DEFAULT_MCP_EXCHANGE_URL)
+    url = _resolve_mcp_url("MCP_EXCHANGE_URL", environment, DEFAULT_MCP_EXCHANGE_URL)
     logger.info("MCP exchange call: url=%s amount=%s currency=%s",
                 url, amount_krw, target_currency)
 
@@ -106,9 +123,9 @@ async def _call_mcp_exchange_async(amount_krw: float, target_currency: str) -> s
         return f"환율 서버 호출 중 오류가 발생했습니다: {type(e).__name__}"
 
 
-def _get_exchange_rate(amount_krw: float, target_currency: str) -> str:
+def _get_exchange_rate(amount_krw: float, target_currency: str, environment: str = "dev") -> str:
     """Sync wrapper for the async MCP call."""
-    return asyncio.run(_call_mcp_exchange_async(amount_krw, target_currency))
+    return asyncio.run(_call_mcp_exchange_async(amount_krw, target_currency, environment))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -117,9 +134,9 @@ def _get_exchange_rate(amount_krw: float, target_currency: str) -> str:
 DEFAULT_MCP_COMMUNITY_URL = "http://localhost:8001/mcp"
 
 
-async def _call_mcp_community_async(query: str, limit: int) -> str:
+async def _call_mcp_community_async(query: str, limit: int, environment: str = "dev") -> str:
     """MCP2 커뮤니티 서버의 search_community_posts 도구를 호출."""
-    url = os.environ.get("MCP_COMMUNITY_URL", DEFAULT_MCP_COMMUNITY_URL)
+    url = _resolve_mcp_url("MCP_COMMUNITY_URL", environment, DEFAULT_MCP_COMMUNITY_URL)
     logger.info("MCP community call: url=%s query=%r limit=%d", url, query, limit)
 
     try:
@@ -140,9 +157,9 @@ async def _call_mcp_community_async(query: str, limit: int) -> str:
         return f"커뮤니티 검색 서버 호출 중 오류가 발생했습니다: {type(e).__name__}"
 
 
-def _search_community_posts(query: str, limit: int = 3) -> str:
+def _search_community_posts(query: str, limit: int = 3, environment: str = "dev") -> str:
     """Sync wrapper for the async MCP call."""
-    return asyncio.run(_call_mcp_community_async(query, limit))
+    return asyncio.run(_call_mcp_community_async(query, limit, environment))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -359,14 +376,19 @@ TOOLS = [
 ]
 
 
-def execute_tool(tool_name: str, tool_input: dict) -> str:
-    """Execute a tool call from Bedrock and return the result as text."""
-    logger.info("Executing tool: name=%s input=%s", tool_name, tool_input)
+def execute_tool(tool_name: str, tool_input: dict, environment: str = "dev") -> str:
+    """Execute a tool call from Bedrock and return the result as text.
+
+    environment(dev/stage/prod)는 자체 MCP(환율·커뮤니티) URL 라우팅에만 쓰인다
+    (ai-chatbot-mcp.md §6/§9). KB·Tavily는 환경 무관.
+    """
+    logger.info("Executing tool: name=%s input=%s env=%s", tool_name, tool_input, environment)
 
     if tool_name == "get_exchange_rate":
         return _get_exchange_rate(
             amount_krw=float(tool_input.get("amount_krw", 0)),
             target_currency=str(tool_input.get("target_currency", "")),
+            environment=environment,
         )
 
     if tool_name == "search_legal_standard":
@@ -376,6 +398,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return _search_community_posts(
             query=str(tool_input.get("query", "")),
             limit=int(tool_input.get("limit", 3)),
+            environment=environment,
         )
 
     if tool_name == "search_web":
